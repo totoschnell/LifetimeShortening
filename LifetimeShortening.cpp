@@ -33,7 +33,8 @@ using Node = std::pair<Value, unsigned>;
 constexpr unsigned WHOLE = std::numeric_limits<unsigned>::max();
 using LivingRange = std::optional<std::pair<Operation *, Operation *>>;
 
-//general alias analysis for memory-semantic quake IR
+//general quantum resource alias analysis for memory-semantic quake IR
+//TODO: lambda definition and lambda use not yet considered
 class AA {
 private:
     //the refs in the set are may-alias with the key, because they are derived from the key
@@ -89,13 +90,16 @@ private:
         else if(auto make_struq = dyn_cast<cudaq::quake::MakeStruqOp>(op)){
             unsigned memberIdx = 0;
             for(Value member : make_struq.getOperands()){
+                //the result struq is alias to all of the operands, because if there is a use of the result struq(eg. as kernel call param), then the resources building this struq have to kept alive
                 deriveGraph[Node(member, WHOLE)].insert(Node(v, WHOLE));
                 deriveGraph[Node(member, WHOLE)].insert(Node(v, memberIdx++));
             }
         }
+        //compiler frontend will reject embedded struq definition, so we can suppose the member of the struq is struq.ref or struq.veq, and the resulting type should match
         else if(auto getMember = dyn_cast<cudaq::quake::GetMemberOp>(op)){
             Value struq = getMember.getStruq();
             uint32_t index = getMember.getIndex();
+            //here we only alias member to member, because a use of the result does not necessarily need all members of the source struq to be alive
             deriveGraph[Node(struq, index)].insert(Node(v, WHOLE));
         }
         else{
@@ -133,6 +137,7 @@ private:
                 }
             }
             else{
+                //this could also be a dead block which cannot be reached by the dataflow, but we ignore this right now
                 existRefWithoutReasonableProvenance = true;
                 blockArgument.getOwner()->getParent()->getParentOp()->emitError("Detected quantum reference as block argument without reasonable provenance").attachNote(blockArgument.getLoc());
                 deriveGraph.clear();
@@ -177,21 +182,20 @@ private:
         });
     }
 
-    //BFS deriveGraph for internal roots
-    void buildInternalProvenance(void){
+    void buildProvenanceResult(DenseSet<Value> &rootSet, DenseMap<Value, DenseSet<Value>> &analysisResult){
         if(existRefWithoutReasonableProvenance){
             return;
         }
-        for(Value internalRoot : internalProvenanceRoots){
-            internalRootProvenanceAnalysisResult[internalRoot];
+        for(Value root : rootSet){
+            analysisResult[root];
             SetVector<Node> workingSet;
             //the root is an alias of itself
-            workingSet.insert(Node(internalRoot, WHOLE));
+            workingSet.insert(Node(root, WHOLE));
             size_t head = 0;
             while(head != workingSet.size()){
                 Node current = workingSet[head++];
                 if(current.second == WHOLE){
-                    internalRootProvenanceAnalysisResult[internalRoot].insert(current.first);
+                    analysisResult[root].insert(current.first);
                 }
                 DenseMap<Node, DenseSet<Node>>::const_iterator it = deriveGraph.find(current);
                 if(it == deriveGraph.end()){
@@ -204,29 +208,15 @@ private:
         }
     }
 
-    //BFS deriveGraph for external roots
-    void buildExternalProvenance(void){
-        if(existRefWithoutReasonableProvenance){
-            return;
+    void buildMayAliasResult(void){
+        for(DenseMap<Value, DenseSet<Value>>::const_iterator it = internalRootProvenanceAnalysisResult.begin(); it != internalRootProvenanceAnalysisResult.end(); ++it){
+            for(const Value &quantumRef : it->getSecond()){
+                mayAliasResult[quantumRef].insert(it->getFirst());
+            }
         }
-        for(Value externalRoot : externalProvenanceRoots){
-            externalRootProvenanceAnalysisResult[externalRoot];
-            SetVector<Node> workingSet;
-            //the root is an alias of itself
-            workingSet.insert(Node(externalRoot, WHOLE));
-            size_t head = 0;
-            while(head != workingSet.size()){
-                Node current = workingSet[head++];
-                if(current.second == WHOLE){
-                    externalRootProvenanceAnalysisResult[externalRoot].insert(current.first);
-                }
-                DenseMap<Node, DenseSet<Node>>::const_iterator it = deriveGraph.find(current);
-                if(it == deriveGraph.end()){
-                    continue;
-                }
-                for(const Node &derivedNode : it->second){
-                    workingSet.insert(derivedNode);
-                }
+        for(DenseMap<Value, DenseSet<Value>>::const_iterator it = externalRootProvenanceAnalysisResult.begin(); it != externalRootProvenanceAnalysisResult.end(); ++it){
+            for(const Value &quantumRef : it->getSecond()){
+                mayAliasResult[quantumRef].insert(it->getFirst());
             }
         }
     }
@@ -235,12 +225,29 @@ public:
     bool existRefWithoutReasonableProvenance;
     DenseMap<Value, DenseSet<Value>> internalRootProvenanceAnalysisResult;
     DenseMap<Value, DenseSet<Value>> externalRootProvenanceAnalysisResult;
-    DenseMap<Value, DenseSet<Value>> mayAliasResult;//TODO: future task
+    DenseMap<Value, DenseSet<Value>> mayAliasResult;
     AA(func::FuncOp func){
         existRefWithoutReasonableProvenance = false;
         buildDeriveGraph(func);
-        buildInternalProvenance();
-        buildExternalProvenance();
+        buildProvenanceResult(internalProvenanceRoots, internalRootProvenanceAnalysisResult);
+        //could be turned off for intra-procedural lifetime shortening, complete AA only
+        buildProvenanceResult(externalProvenanceRoots, externalRootProvenanceAnalysisResult);
+        //could be turned off for intra-procedural lifetime shortening, complete AA only
+        buildMayAliasResult();
+    }
+
+    std::optional<bool> mayAlias(Value v1, Value v2){
+        if(!isQuantumReferenceType(v1.getType()) && !isQuantumReferenceType(v2.getType())){
+            //unknown value type, return nullopt
+            return std::nullopt;
+        }
+        else if(isQuantumReferenceType(v1.getType()) != isQuantumReferenceType(v2.getType())){
+            //testing a quantum reference type with another type, they must not be alias
+            return std::optional(false);
+        }
+        else{
+            //TODO: test if there is intersection between the root sets of v1 and v2
+        }
     }
 };
 
@@ -401,11 +408,11 @@ struct TestProvenancePass
         os.flush();
     }
 };
-//end of code generated by Chatgpt
 
 // Register the test pass.
 static PassRegistration<TestProvenancePass> testProvenancePass;
 #endif
+//end of code generated by Chatgpt
 
 #ifdef RELEASE
 struct LifetimeShortening : public PassWrapper<LifetimeShortening, OperationPass<func::FuncOp>>{
@@ -441,7 +448,7 @@ struct LifetimeShortening : public PassWrapper<LifetimeShortening, OperationPass
         return checkResult;
     }
 
-    //currently we are not keeping the allocation order of quantum resources according to the definition order in the source file.
+    //at the moment we are not keeping the allocation order of quantum resources according to the definition order in the source file, because this weakens the optimization effect
     void runOnOperation() override{
         if(!checkLifetimeShorteningPrecondition()){
             return;
